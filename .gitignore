@@ -1,6 +1,8 @@
 .venv/
 .env
 .pw-profile/
+.pw-profile-*/
+.env-*
 __pycache__/
 *.pyc
 

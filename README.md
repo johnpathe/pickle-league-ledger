@@ -20,7 +20,10 @@ dependencies and log in.)
 
 - If you're not logged in (or your session expired), a red banner appears at
   the top with a **Log in with browser** button — click it, log in to DUPR in
-  the Chromium window that opens, and the app picks it back up automatically.
+  the Chrome window that opens, and the app picks it back up automatically.
+  The browser selector also offers Playwright Chromium and installed Edge.
+  Login uses a separate app-only profile, not your normal browser profile.
+  If login fails, the banner shows the reason and lets you retry.
 - **Season Setup** (top card): event name, location, club ID, and your roster
   of regular players. Set this up once per season/competition. The player
   search shows DUPR ID + rating so you can tell same-named players apart —
@@ -118,10 +121,22 @@ python -m venv .venv
 .venv\Scripts\python.exe get_token.py
 ```
 
-The last command opens a Chromium window on `dashboard.dupr.com` — log in
-**in that window**. It reads the session cookie, writes it to a local `.env`
-file, and closes the browser. The token lasts ~30 days; rerun `get_token.py`
-when it expires (it'll skip the login, since `.pw-profile/` stays signed in).
+The last command opens **installed Google Chrome** on `dashboard.dupr.com/login`
+— log in **in that window**. To use a different browser, run
+`get_token.py --browser chromium` or `get_token.py --browser msedge` instead.
+Chrome/Edge must be installed; Chromium uses the Playwright installation above.
+There is no silent fallback to another browser.
+
+The helper ignores expired access cookies and removes rejected DUPR auth
+cookies before opening login. It saves a token only after a read-only
+`GET /user/v1.0/profile` accepts it, then closes the browser. Rerun it when
+your session expires or is revoked; an existing session is reused only if
+it still validates. Login waits at most 10 minutes. Closing the window or
+failing to open it is reported in the app banner and terminal.
+
+The saved `.env` login takes precedence over inherited `DUPR_BEARER_TOKEN`
+environment variables, so an old variable cannot override a successful
+re-login in a running app. Other `.env` settings are preserved.
 
 Then copy `roster.example.json` to `roster.json` and fill in your own event
 name, location, club ID, and roster (or just use the Season Setup card in the
@@ -152,6 +167,7 @@ stays on your machine the same way.
 | `requirements.txt` | Python dependencies |
 | `.env` | Your session token (gitignored — never commit this) |
 | `.pw-profile/` | Saved browser login for `get_token.py` (gitignored) |
+| `.pw-profile-chrome/` / `.pw-profile-msedge/` | Separate app-only Chrome/Edge login profiles (gitignored) |
 
 ## How match submission works
 
@@ -197,9 +213,46 @@ just call them directly before deciding how to submit.
 
 ## Manual token fallback
 
-If `get_token.py` breaks: log in at <https://dashboard.dupr.com>, open DevTools
-→ Application → Cookies → `https://api.dupr.com`, copy the `__Host-dupr_at`
-value into `.env` as `DUPR_BEARER_TOKEN=...`.
+If Sign In appears unresponsive in Chromium, select **Chrome** and retry.
+This uses your installed browser with a separate app profile, without
+changing the user agent or accessing your normal browser's cookies.
+If the selected browser is missing or its app profile is already in use,
+the banner explains how to retry. Close other app login windows first.
+If login also fails in your normal browser, check your connection or DUPR's
+service before retrying. Network/profile-check failures are distinguished
+from an expired session in the banner.
+
+An unresponsive Chromium login does not by itself establish a user-agent
+block. Chrome and Chromium both report a Chrome-style user agent, and public
+login-page checks do not test authentication with valid credentials.
+
+If you already have a session cookie, expand **Paste a DUPR session cookie**
+near the top of the app. Paste either the `__Host-dupr_at` value or the full
+single-line **Cookie** request header copied directly from DevTools, then
+click **Save session cookie**. The field is masked and cleared on submission.
+Only `__Host-dupr_at` and, if present, `__Host-dupr_rt` are saved; analytics
+and other cookies are ignored. Close any app login browser first.
+
+The app checks the access cookie with a read-only DUPR profile request before
+saving it locally and refreshing its login status. Expired, malformed or
+rejected cookies and connection failures show an error without replacing
+your saved session. If DUPR is unavailable, retry when it recovers.
+
+To obtain the access value: log in at <https://dashboard.dupr.com>, open
+DevTools → Application → Cookies → `https://api.dupr.com`, and copy
+`__Host-dupr_at`. Alternatively copy the Cookie header from a request to
+`api.dupr.com` in DevTools → Network. Paste directly into the app, not into
+chat or a formatted document.
+
+You can still edit `.env` manually as `DUPR_BEARER_TOKEN=...`; remove any old
+`DUPR_REFRESH_TOKEN` entry if you are not updating that cookie too.
+Never paste cookie values or passwords into diagnostics, chat, or this repo.
+
+## Testing login recovery
+
+Run `.venv\Scripts\python.exe -m unittest -v test_login` for isolated login
+recovery tests. Cookies, API replies and browser processes are faked; these
+tests do not log in to DUPR or submit matches.
 
 ## No third-party DUPR library
 

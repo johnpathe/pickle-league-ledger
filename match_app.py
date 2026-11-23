@@ -32,11 +32,14 @@ import io
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, request, send_from_directory
 
 from dupr_session import make_client
+from get_token import BROWSERS, LOGIN_ERRORS, LoginError, parse_session_cookie, validate_access, write_env
 import stats as stats_mod
 
 HERE = Path(__file__).parent
@@ -72,18 +75,33 @@ def save_roster(data):
 
 # ---------------------------------------------------------------- DUPR calls
 
-def get_current_profile(client):
+class ProfileCheckError(Exception):
+    pass
+
+
+def get_current_profile(client, *, report_errors=False):
     """Returns the logged-in user's profile dict, or None if not authenticated."""
     try:
         r = client.session.get(f"{API_BASE}/user/v1.0/profile", timeout=15)
-    except Exception:
+    except requests.RequestException:
+        message = "Cannot reach DUPR to check your session. Check your connection and retry."
+        app.logger.warning(message)
+        if report_errors:
+            raise ProfileCheckError(message) from None
         return None
     if r.status_code in (401, 403):
         return None
     try:
         r.raise_for_status()
-        return r.json().get("result")
-    except Exception:
+        profile = r.json().get("result")
+        if not isinstance(profile, dict) or not profile:
+            raise ValueError("Missing profile")
+        return profile
+    except (requests.RequestException, ValueError, AttributeError):
+        message = "DUPR could not verify your session. Try again later."
+        app.logger.warning(message)
+        if report_errors:
+            raise ProfileCheckError(message) from None
         return None
 
 
@@ -228,30 +246,100 @@ def set_roster():
 
 @app.route("/api/status")
 def status():
-    client = make_client()
-    profile = get_current_profile(client)
-    result = {"authenticated": profile is not None}
-    if not profile:
+    result = {"authenticated": False, "login": login_status()}
+    try:
+        client = make_client()
+    except SystemExit:
         return jsonify(result)
-
-    result["user"] = {"id": profile.get("id"), "fullName": profile.get("fullName")}
-    roster = load_roster()
-    result["submission"] = get_submission_mode(client, roster)
+    try:
+        profile = get_current_profile(client, report_errors=True)
+        result["authenticated"] = profile is not None
+        if profile:
+            result["user"] = {"id": profile.get("id"), "fullName": profile.get("fullName")}
+            result["submission"] = get_submission_mode(client, load_roster())
+    except ProfileCheckError as error:
+        result["authError"] = str(error)
+    finally:
+        client.session.close()
     return jsonify(result)
 
 
 _relogin_proc = None
+_relogin_lock = threading.Lock()
+_relogin_start_error = None
+
+
+def login_status():
+    with _relogin_lock:
+        if _relogin_start_error:
+            return {"state": "failed", "error": _relogin_start_error}
+        if _relogin_proc is None:
+            return {"state": "idle"}
+        code = _relogin_proc.poll()
+        if code is None:
+            return {"state": "running"}
+        if code == 0:
+            return {"state": "succeeded"}
+        return {"state": "failed", "error": LOGIN_ERRORS.get(
+            code, "Login helper failed. Check the app terminal for details and retry."
+        )}
 
 
 @app.route("/api/relogin", methods=["POST"])
 def relogin():
-    global _relogin_proc
-    already_running = _relogin_proc is not None and _relogin_proc.poll() is None
-    if not already_running:
-        _relogin_proc = subprocess.Popen(
-            [sys.executable, str(HERE / "get_token.py")], cwd=str(HERE)
-        )
+    global _relogin_proc, _relogin_start_error
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict) or data.get("browser", "chrome") not in BROWSERS:
+        return jsonify({"error": "Choose Chrome, Chromium, or Edge for login."}), 400
+    with _relogin_lock:
+        already_running = _relogin_proc is not None and _relogin_proc.poll() is None
+        if not already_running:
+            _relogin_start_error = None
+            try:
+                _relogin_proc = subprocess.Popen(
+                    [sys.executable, str(HERE / "get_token.py"),
+                     "--browser", data.get("browser", "chrome")], cwd=str(HERE)
+                )
+            except OSError:
+                _relogin_start_error = "Could not start the login helper. Check the app's Python installation."
+                app.logger.error(_relogin_start_error)
+                return jsonify({"error": _relogin_start_error}), 500
     return jsonify({"started": not already_running, "alreadyRunning": already_running})
+
+
+@app.route("/api/session-cookie", methods=["POST"])
+def save_session_cookie():
+    global _relogin_proc, _relogin_start_error
+    origin = request.headers.get("Origin")
+    if request.remote_addr not in ("127.0.0.1", "::1") or (
+        origin is not None and origin != request.host_url.rstrip("/")
+    ):
+        return jsonify({"error": "Cookie entry is only available from this local app."}), 403
+    if request.content_length is not None and request.content_length > 65536:
+        return jsonify({"error": "Cookie input is too large. Paste only the access cookie or Cookie header."}), 413
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("cookie"), str):
+        return jsonify({"error": "Enter a DUPR access cookie or Cookie header."}), 400
+    try:
+        access, refresh = parse_session_cookie(data["cookie"])
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    with _relogin_lock:
+        if _relogin_proc is not None and _relogin_proc.poll() is None:
+            return jsonify({"error": "Close the app's login browser before saving a cookie."}), 409
+        try:
+            if not validate_access(access):
+                return jsonify({"error": "DUPR rejected this access cookie. Obtain a fresh cookie and retry."}), 401
+            write_env(access, refresh)
+        except LoginError as error:
+            app.logger.warning("Manual session validation failed (code %s).", error.code)
+            return jsonify({"error": str(error)}), 502
+        except OSError:
+            app.logger.error("Could not save the manually entered DUPR session.")
+            return jsonify({"error": LOGIN_ERRORS[7]}), 500
+        _relogin_proc = None
+        _relogin_start_error = None
+    return jsonify({"ok": True})
 
 
 _stats_cache = {"key": None, "matches": None}
