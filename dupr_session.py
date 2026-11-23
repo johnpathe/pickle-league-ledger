@@ -67,13 +67,13 @@ def _read_env_file() -> dict:
 
 
 def get_token() -> str | None:
-    """The current access token, preferring a real env var if one is set."""
-    return os.environ.get("DUPR_BEARER_TOKEN") or _read_env_file().get("DUPR_BEARER_TOKEN")
+    """Prefer the freshly saved login over a possibly stale inherited env var."""
+    return _read_env_file().get("DUPR_BEARER_TOKEN") or os.environ.get("DUPR_BEARER_TOKEN")
 
 
 def make_client() -> DuprClient:
     env = _read_env_file()
-    token = os.environ.get("DUPR_BEARER_TOKEN") or env.get("DUPR_BEARER_TOKEN")
+    token = env.get("DUPR_BEARER_TOKEN") or os.environ.get("DUPR_BEARER_TOKEN")
     if not token:
         raise SystemExit(
             "No token found. Run:  .venv\\Scripts\\python.exe get_token.py"
@@ -82,7 +82,9 @@ def make_client() -> DuprClient:
     client = DuprClient()
     client.session.cookies.set(AT_COOKIE, token, domain=API_HOST, secure=True)
 
-    refresh = os.environ.get("DUPR_REFRESH_TOKEN") or env.get("DUPR_REFRESH_TOKEN")
+    # A saved login without a refresh cookie must not reuse an older env cookie.
+    refresh = (env.get("DUPR_REFRESH_TOKEN") if env.get("DUPR_BEARER_TOKEN")
+               else os.environ.get("DUPR_REFRESH_TOKEN"))
     if refresh:
         client.session.cookies.set(RT_COOKIE, refresh, domain=API_HOST, secure=True)
     return client

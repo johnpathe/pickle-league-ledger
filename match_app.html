@@ -268,16 +268,22 @@ function todayISO() {
 // ---------------------------------------------------------------- auth/status
 
 let reloginPoll = null;
+let loginBrowser = "chrome";
 
 async function checkStatus() {
   let s;
   try {
-    s = await (await fetch("/api/status")).json();
+    const response = await fetch("/api/status");
+    if (!response.ok) throw new Error("Status request failed");
+    s = await response.json();
   } catch (e) {
     renderAuthBanner({authenticated: false, networkError: true});
     return;
   }
   renderAuthBanner(s);
+  if (!s.authenticated && s.login && s.login.state === "running" && reloginPoll === null) {
+    pollRelogin();
+  }
   return s;
 }
 
@@ -287,11 +293,25 @@ function renderAuthBanner(s) {
   const hint = document.getElementById("modeHint");
 
   if (!s.authenticated) {
+    const running = s.login && s.login.state === "running";
+    const error = s.login && s.login.state === "failed" ? s.login.error : s.authError;
+    const message = s.networkError ? "Can't reach the local server." :
+      running ? "Sign in to DUPR in the app's login browser. Waiting (up to 10 minutes)..." :
+      error || (s.login && s.login.state === "succeeded" ?
+        "The saved session was not accepted by DUPR. Please retry login." :
+        "Not logged in to DUPR (or your session expired).");
     el.innerHTML = `
-      <div class="banner error">
-        <span>${s.networkError ? "Can't reach the local server." : "Not logged in to DUPR (or your session expired)."}</span>
-        <button class="btn" id="reloginBtn" onclick="startRelogin()">Log in with browser</button>
+      <div class="banner ${running ? "warn" : "error"}">
+        <span id="authMessage"></span>
+        <select id="loginBrowser" aria-label="Login browser" onchange="loginBrowser=this.value" ${running ? "disabled" : ""}>
+          <option value="chrome">Chrome (installed)</option>
+          <option value="chromium">Chromium (Playwright)</option>
+          <option value="msedge">Edge (installed)</option>
+        </select>
+        <button class="btn" id="reloginBtn" onclick="startRelogin()" ${running ? "disabled" : ""}>${running ? "Waiting for login..." : "Log in with browser"}</button>
       </div>`;
+    document.getElementById("authMessage").textContent = message;
+    document.getElementById("loginBrowser").value = loginBrowser;
     badge.innerHTML = "";
     hint.textContent = "";
     submissionMode = {mode: "fallback", reason: "Not logged in."};
@@ -311,15 +331,33 @@ function renderAuthBanner(s) {
 async function startRelogin() {
   const btn = document.getElementById("reloginBtn");
   if (btn) { btn.disabled = true; btn.textContent = "Opening browser…"; }
-  await fetch("/api/relogin", {method: "POST"});
-  const el = document.getElementById("authBanner");
-  el.innerHTML = `<div class="banner warn"><span>Log in to DUPR in the Chromium window that just opened. Waiting…</span></div>`;
-  clearInterval(reloginPoll);
-  reloginPoll = setInterval(async () => {
+  clearTimeout(reloginPoll);
+  reloginPoll = null;
+  try {
+    const response = await fetch("/api/relogin", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({browser: loginBrowser}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not start login.");
+  } catch (error) {
+    renderAuthBanner({authenticated: false, login: {state: "failed", error: error.message}});
+    return;
+  }
+  renderAuthBanner({authenticated: false, login: {state: "running"}});
+  pollRelogin();
+}
+
+function pollRelogin() {
+  clearTimeout(reloginPoll);
+  // Schedule after each request, so a slow DUPR check cannot overlap another.
+  reloginPoll = setTimeout(async () => {
     const s = await checkStatus();
+    reloginPoll = null;
     if (s && s.authenticated) {
-      clearInterval(reloginPoll);
       loadRoster();
+    } else if (s && s.login && s.login.state === "running") {
+      pollRelogin();
     }
   }, 3000);
 }
