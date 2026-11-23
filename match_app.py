@@ -39,7 +39,7 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 
 from dupr_session import make_client
-from get_token import BROWSERS, LOGIN_ERRORS
+from get_token import BROWSERS, LOGIN_ERRORS, LoginError, parse_session_cookie, validate_access, write_env
 import stats as stats_mod
 
 HERE = Path(__file__).parent
@@ -305,6 +305,41 @@ def relogin():
                 app.logger.error(_relogin_start_error)
                 return jsonify({"error": _relogin_start_error}), 500
     return jsonify({"started": not already_running, "alreadyRunning": already_running})
+
+
+@app.route("/api/session-cookie", methods=["POST"])
+def save_session_cookie():
+    global _relogin_proc, _relogin_start_error
+    origin = request.headers.get("Origin")
+    if request.remote_addr not in ("127.0.0.1", "::1") or (
+        origin is not None and origin != request.host_url.rstrip("/")
+    ):
+        return jsonify({"error": "Cookie entry is only available from this local app."}), 403
+    if request.content_length is not None and request.content_length > 65536:
+        return jsonify({"error": "Cookie input is too large. Paste only the access cookie or Cookie header."}), 413
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("cookie"), str):
+        return jsonify({"error": "Enter a DUPR access cookie or Cookie header."}), 400
+    try:
+        access, refresh = parse_session_cookie(data["cookie"])
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    with _relogin_lock:
+        if _relogin_proc is not None and _relogin_proc.poll() is None:
+            return jsonify({"error": "Close the app's login browser before saving a cookie."}), 409
+        try:
+            if not validate_access(access):
+                return jsonify({"error": "DUPR rejected this access cookie. Obtain a fresh cookie and retry."}), 401
+            write_env(access, refresh)
+        except LoginError as error:
+            app.logger.warning("Manual session validation failed (code %s).", error.code)
+            return jsonify({"error": str(error)}), 502
+        except OSError:
+            app.logger.error("Could not save the manually entered DUPR session.")
+            return jsonify({"error": LOGIN_ERRORS[7]}), 500
+        _relogin_proc = None
+        _relogin_start_error = None
+    return jsonify({"ok": True})
 
 
 _stats_cache = {"key": None, "matches": None}

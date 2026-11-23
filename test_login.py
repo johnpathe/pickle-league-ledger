@@ -179,6 +179,26 @@ class SavedLoginTests(unittest.TestCase):
             self.assertEqual(list(Path(folder).iterdir()), [env])
 
 
+class ManualCookieTests(unittest.TestCase):
+    def test_raw_access_and_full_header_extract_only_auth_cookies(self):
+        access = token(time.time() + 3600)
+        refresh = token(time.time() + 7200)
+        self.assertEqual(get_token.parse_session_cookie(access), (access, None))
+        header = f"Cookie: tracking=ignore; {get_token.AT_COOKIE}={access}; {get_token.RT_COOKIE}={refresh}; other=ignore"
+        self.assertEqual(get_token.parse_session_cookie(header), (access, refresh))
+
+    def test_invalid_expired_missing_and_duplicate_cookies_are_rejected(self):
+        access = token(time.time() + 3600)
+        array_payload = base64.urlsafe_b64encode(b"[]").decode().rstrip("=")
+        for text in ("", token(1), "tracking=ignore",
+                     f"{get_token.AT_COOKIE}={access}; {get_token.AT_COOKIE}={access}",
+                     f"{get_token.AT_COOKIE}={access}; {get_token.RT_COOKIE}=bad",
+                     access + "\nOTHER_SETTING=injected",
+                     f"test-header.{array_payload}.not-a-signature"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                get_token.parse_session_cookie(text)
+
+
 class AppLoginTests(unittest.TestCase):
     def setUp(self):
         self.web = match_app.app.test_client()
@@ -256,6 +276,67 @@ class AppLoginTests(unittest.TestCase):
             reply = self.web.get("/api/status")
         self.assertTrue(reply.json["authenticated"])
         self.assertEqual(reply.json["login"], {"state": "succeeded"})
+
+    def test_manual_header_is_verified_and_saved_without_tracking_cookies(self):
+        access = token(time.time() + 3600)
+        refresh = token(time.time() + 7200)
+        with tempfile.TemporaryDirectory() as folder:
+            env = Path(folder) / ".env"
+            env.write_text("OTHER_SETTING=keep\n")
+            with patch.object(get_token, "ENV_PATH", env), \
+                 patch.object(match_app, "validate_access", return_value=True) as validate, \
+                 patch.object(get_token, "log"):
+                reply = self.web.post("/api/session-cookie", json={
+                    "cookie": f"tracking=ignore; {get_token.AT_COOKIE}={access}; {get_token.RT_COOKIE}={refresh}"
+                })
+            self.assertEqual(reply.json, {"ok": True})
+            validate.assert_called_once_with(access)
+            self.assertEqual(env.read_text(),
+                             f"OTHER_SETTING=keep\nDUPR_BEARER_TOKEN={access}\nDUPR_REFRESH_TOKEN={refresh}\n")
+            self.assertNotIn(access, reply.get_data(as_text=True))
+
+    def test_manual_invalid_input_is_rejected_without_saving_or_network_calls(self):
+        with patch.object(match_app, "validate_access") as validate, \
+             patch.object(match_app, "write_env") as save:
+            for data in ({}, {"cookie": None}, [], {"cookie": "invalid"}, {"cookie": token(1)}):
+                self.assertEqual(self.web.post("/api/session-cookie", json=data).status_code, 400)
+            self.assertEqual(self.web.post("/api/session-cookie", data="not-json").status_code, 400)
+            self.assertEqual(self.web.post("/api/session-cookie", data="x" * 65537).status_code, 413)
+        validate.assert_not_called()
+        save.assert_not_called()
+
+    def test_manual_cookie_rejection_and_network_failure_preserve_saved_session(self):
+        access = token(time.time() + 3600)
+        for accepted, code in ((False, 401), (get_token.LoginError(5), 502)):
+            with self.subTest(code=code):
+                validate = Mock(side_effect=accepted) if isinstance(accepted, Exception) else Mock(return_value=accepted)
+                with patch.object(match_app, "validate_access", validate), \
+                     patch.object(match_app, "write_env") as save:
+                    reply = self.web.post("/api/session-cookie", json={"cookie": access})
+                self.assertEqual(reply.status_code, code)
+                self.assertNotIn(access, reply.get_data(as_text=True))
+                save.assert_not_called()
+
+    def test_manual_save_failure_is_reported_without_sensitive_details(self):
+        with patch.object(match_app, "validate_access", return_value=True), \
+             patch.object(match_app, "write_env", side_effect=PermissionError("sensitive-detail")):
+            reply = self.web.post("/api/session-cookie", json={"cookie": token(time.time() + 3600)})
+        self.assertEqual(reply.status_code, 500)
+        self.assertNotIn("sensitive-detail", reply.json["error"])
+
+    def test_manual_cookie_cannot_race_login_helper_or_be_saved_cross_origin(self):
+        access = token(time.time() + 3600)
+        match_app._relogin_proc = Mock()
+        match_app._relogin_proc.poll.return_value = None
+        with patch.object(match_app, "validate_access") as validate, \
+             patch.object(match_app, "write_env") as save:
+            self.assertEqual(self.web.post("/api/session-cookie", json={"cookie": access}).status_code, 409)
+            self.assertEqual(self.web.post("/api/session-cookie", json={"cookie": access},
+                                          headers={"Origin": "https://other.test"}).status_code, 403)
+            self.assertEqual(self.web.post("/api/session-cookie", json={"cookie": access},
+                                          environ_overrides={"REMOTE_ADDR": "192.0.2.1"}).status_code, 403)
+        validate.assert_not_called()
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

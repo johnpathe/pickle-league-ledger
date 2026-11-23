@@ -18,6 +18,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -57,7 +58,8 @@ def decode_jwt(tok: str) -> dict:
     try:
         payload = tok.split(".")[1]
         payload += "=" * (-len(payload) % 4)
-        return json.loads(base64.urlsafe_b64decode(payload))
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims if isinstance(claims, dict) else {}
     except (ValueError, IndexError, binascii.Error, UnicodeDecodeError):
         return {}
 
@@ -67,6 +69,36 @@ def usable_access(access: str | None) -> bool:
         return False
     expiry = decode_jwt(access).get("exp")
     return isinstance(expiry, (int, float)) and expiry > time.time() + 30
+
+
+def parse_session_cookie(text: str) -> tuple[str, str | None]:
+    """Extract auth cookies only; never persist analytics or other header values."""
+    text = text.strip()
+    if not text or len(text) > 32768 or "\n" in text or "\r" in text:
+        raise ValueError("Paste a cookie value or a single-line Cookie header (up to 32 KB).")
+    if text.lower().startswith("cookie:"):
+        text = text.partition(":")[2].strip()
+    access, refresh = text, None
+    if "=" in text or ";" in text:
+        auth = {}
+        for part in text.split(";"):
+            name, separator, value = part.strip().partition("=")
+            if separator and name in (AT_COOKIE, RT_COOKIE):
+                if name in auth:
+                    raise ValueError("The header contains duplicate DUPR auth cookies. Copy it again.")
+                auth[name] = value.strip()
+        access, refresh = auth.get(AT_COOKIE, ""), auth.get(RT_COOKIE)
+    for value in (access, refresh):
+        if value is not None and not re.fullmatch(
+            r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value
+        ):
+            raise ValueError(
+                "Paste the __Host-dupr_at value or a Cookie header containing it "
+                "directly from DevTools, without quotes or Markdown formatting."
+            )
+    if not usable_access(access):
+        raise ValueError("The access cookie is expired or invalid. Obtain a fresh __Host-dupr_at cookie.")
+    return access, refresh
 
 
 def validate_access(access: str) -> bool:

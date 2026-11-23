@@ -27,7 +27,7 @@
   }
   .card h2 .chev { font-size: 12px; color: var(--muted); }
   label { font-size: 11.5px; color: var(--muted); display: block; margin-bottom: 2px; }
-  input[type=text], input[type=date], input[type=number], select {
+  input[type=text], input[type=password], input[type=date], input[type=number], select {
     width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
     font-size: 14px; background: #fff; color: var(--text);
   }
@@ -124,6 +124,22 @@
   <h1>Pickle League Ledger</h1>
 
   <div id="authBanner"></div>
+
+  <details class="card" id="manualCookieCard">
+    <summary>Paste a DUPR session cookie</summary>
+    <p class="hint" id="cookieHelp">Paste the __Host-dupr_at value or the full Cookie header copied directly from DevTools.
+      Only DUPR's access and refresh cookies are kept. These are login credentials: do not share them.
+      The app verifies the session with DUPR before saving it to your local .env file.</p>
+    <form onsubmit="saveSessionCookie(event)">
+      <label for="sessionCookie">Access cookie or Cookie header</label>
+      <input type="password" id="sessionCookie" required maxlength="32768"
+        autocomplete="off" spellcheck="false" aria-describedby="cookieHelp">
+      <div class="actions-row">
+        <button type="submit" class="btn" id="saveCookieBtn">Save session cookie</button>
+      </div>
+      <p class="hint" id="cookieMessage" role="status" aria-live="polite"></p>
+    </form>
+  </details>
 
   <div class="card" id="setupCard">
     <h2 onclick="toggleSetup()">Season Setup <span class="chev" id="setupChev">▾</span></h2>
@@ -360,6 +376,37 @@ function pollRelogin() {
       pollRelogin();
     }
   }, 3000);
+}
+
+async function saveSessionCookie(event) {
+  event.preventDefault();
+  const input = document.getElementById("sessionCookie");
+  const button = document.getElementById("saveCookieBtn");
+  const message = document.getElementById("cookieMessage");
+  let cookie = input.value;
+  input.value = "";
+  button.disabled = true;
+  message.textContent = "Checking the cookie with DUPR...";
+  try {
+    const response = await fetch("/api/session-cookie", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({cookie}),
+    });
+    cookie = "";
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save the session cookie.");
+    clearTimeout(reloginPoll);
+    reloginPoll = null;
+    message.textContent = "Session cookie verified and saved locally.";
+    const status = await checkStatus();
+    if (status && status.authenticated) await loadRoster();
+  } catch (error) {
+    message.textContent = error instanceof TypeError ?
+      "Can't reach the local server. Retry when the app is running." : error.message;
+  } finally {
+    cookie = "";
+    button.disabled = false;
+  }
 }
 
 // -------------------------------------------------------------------- roster

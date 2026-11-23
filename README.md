@@ -226,10 +226,26 @@ An unresponsive Chromium login does not by itself establish a user-agent
 block. Chrome and Chromium both report a Chrome-style user agent, and public
 login-page checks do not test authentication with valid credentials.
 
-If browser login still fails: log in at <https://dashboard.dupr.com>, open DevTools
-→ Application → Cookies → `https://api.dupr.com`, copy the `__Host-dupr_at`
-value into `.env` as `DUPR_BEARER_TOKEN=...`. Remove any old
-`DUPR_REFRESH_TOKEN` entry if you are not also updating that cookie.
+If you already have a session cookie, expand **Paste a DUPR session cookie**
+near the top of the app. Paste either the `__Host-dupr_at` value or the full
+single-line **Cookie** request header copied directly from DevTools, then
+click **Save session cookie**. The field is masked and cleared on submission.
+Only `__Host-dupr_at` and, if present, `__Host-dupr_rt` are saved; analytics
+and other cookies are ignored. Close any app login browser first.
+
+The app checks the access cookie with a read-only DUPR profile request before
+saving it locally and refreshing its login status. Expired, malformed or
+rejected cookies and connection failures show an error without replacing
+your saved session. If DUPR is unavailable, retry when it recovers.
+
+To obtain the access value: log in at <https://dashboard.dupr.com>, open
+DevTools → Application → Cookies → `https://api.dupr.com`, and copy
+`__Host-dupr_at`. Alternatively copy the Cookie header from a request to
+`api.dupr.com` in DevTools → Network. Paste directly into the app, not into
+chat or a formatted document.
+
+You can still edit `.env` manually as `DUPR_BEARER_TOKEN=...`; remove any old
+`DUPR_REFRESH_TOKEN` entry if you are not updating that cookie too.
 Never paste cookie values or passwords into diagnostics, chat, or this repo.
 
 ## Testing login recovery
